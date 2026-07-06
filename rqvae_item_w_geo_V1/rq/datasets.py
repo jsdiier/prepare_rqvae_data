@@ -61,7 +61,25 @@ class EmbDataset(data.Dataset):
     # parquet 流式加载 + memmap 缓存
     # ------------------------------------------------------------------
     def _load_parquet_streaming(self, data_path, emb_column):
-        cache_path = data_path + ".embcache.npy"
+        # EMB_CACHE_DTYPE=fp16 时缓存存 float16，内存/磁盘减半；
+        # __getitem__ 会转回 float32，训练侧无感知
+        dtype_env = os.environ.get("EMB_CACHE_DTYPE", "fp32").lower()
+        if dtype_env in ("fp16", "f16", "float16", "half"):
+            self._cache_descr, self._cache_dtype = "<f2", np.float16
+            suffix = ".embcache.f16.npy"
+        else:
+            self._cache_descr, self._cache_dtype = "<f4", np.float32
+            suffix = ".embcache.npy"
+
+        # EMB_CACHE_DIR 可把缓存重定向到本地盘（NFS 上 mmap 随机读极慢时用）
+        cache_dir = os.environ.get("EMB_CACHE_DIR")
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_path = os.path.join(
+                cache_dir, os.path.basename(data_path) + suffix
+            )
+        else:
+            cache_path = data_path + suffix
         pf = pq.ParquetFile(data_path)
         num_rows = pf.metadata.num_rows
 
@@ -101,7 +119,7 @@ class EmbDataset(data.Dataset):
                     # write_array_header_1_0 自带 magic 前缀，不要重复写
                     np.lib.format.write_array_header_1_0(
                         out,
-                        {"descr": "<f4", "fortran_order": False,
+                        {"descr": self._cache_descr, "fortran_order": False,
                          "shape": (num_rows, dim)},
                     )
                 elif chunk.shape[1] != dim:
@@ -118,7 +136,7 @@ class EmbDataset(data.Dataset):
                     inf_cnt += int(inf_mask.sum())
                     chunk[inf_mask] = 0.0
 
-                out.write(np.ascontiguousarray(chunk, dtype="<f4").tobytes())
+                out.write(np.ascontiguousarray(chunk, dtype=self._cache_dtype).tobytes())
                 offset += len(chunk)
                 pbar.update(len(chunk))
         finally:
@@ -167,14 +185,57 @@ class EmbDataset(data.Dataset):
 
     @staticmethod
     def _available_memory_bytes():
+        avail = None
         try:
             with open("/proc/meminfo") as f:
                 for line in f:
                     if line.startswith("MemAvailable:"):
-                        return int(line.split()[1]) * 1024
+                        avail = int(line.split()[1]) * 1024
+                        break
         except OSError:
+            return None
+
+        # 容器内 /proc/meminfo 显示的是宿主机内存，真正的约束是 cgroup 限额，
+        # 取两者较小值，避免整载时撞限额被 OOM kill
+        for limit_path, usage_path in (
+            ("/sys/fs/cgroup/memory.max",
+             "/sys/fs/cgroup/memory.current"),                      # cgroup v2
+            ("/sys/fs/cgroup/memory/memory.limit_in_bytes",
+             "/sys/fs/cgroup/memory/memory.usage_in_bytes"),        # cgroup v1
+        ):
+            try:
+                with open(limit_path) as f:
+                    raw = f.read().strip()
+                if raw == "max":
+                    break
+                limit = int(raw)
+                if limit >= 1 << 60:  # v1 无限额时是个近似无穷大的数
+                    break
+                with open(usage_path) as f:
+                    usage = int(f.read().strip())
+                cg_avail = max(limit - usage, 0)
+                avail = cg_avail if avail is None else min(avail, cg_avail)
+                break
+            except (OSError, ValueError):
+                continue
+
+        # k8s 的限额常挂在 Pod 层（容器自身 cgroup 显示无限额），
+        # 该层限额可通过 memory.stat 的 hierarchical_memory_limit 看到
+        try:
+            hier_limit = None
+            with open("/sys/fs/cgroup/memory/memory.stat") as f:
+                for line in f:
+                    if line.startswith("hierarchical_memory_limit"):
+                        hier_limit = int(line.split()[1])
+                        break
+            if hier_limit is not None and hier_limit < 1 << 60:
+                with open("/sys/fs/cgroup/memory/memory.usage_in_bytes") as f:
+                    usage = int(f.read().strip())
+                cg_avail = max(hier_limit - usage, 0)
+                avail = cg_avail if avail is None else min(avail, cg_avail)
+        except (OSError, ValueError):
             pass
-        return None
+        return avail
 
     def _resolve_emb_column(self, column_names, emb_column):
         if emb_column is not None:
