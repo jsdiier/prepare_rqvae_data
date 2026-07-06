@@ -33,5 +33,5 @@ python rq/rqvae.py \
   --data_path ./item_info/item_emb.parquet \
   --ckpt_dir ./rq/rq_model \
   --lr 1e-4 \
-  --epochs 50 \
+  --epochs 5 \
   --batch_size 512
