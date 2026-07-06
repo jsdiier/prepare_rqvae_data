@@ -1,0 +1,39 @@
+#!/bin/bash
+set -e
+export PYTHONNOUSERSITE=1
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ------------------------
+# 用户可修改参数
+# ------------------------
+CKPT_PATH="./rq/rq_model/Jul-03-2026_17-41-45/best_collision_model.pth"
+OUTPUT_FILE="./item_info/MX_item_recall.index.parquet"
+
+# ===============================
+# 自动识别环境
+# ===============================
+if [ -d "/nfs/dataset-ofs-rank-ssl" ]; then
+    DATA_PREFIX="/nfs/dataset-ofs-rank-ssl"
+elif [ -d "/tmp-data/prod_soda_trade_strategy/rank-ssl" ]; then
+    DATA_PREFIX="/tmp-data/prod_soda_trade_strategy/rank-ssl"
+elif [ -d "/home/luban/rank-ssl" ]; then
+    DATA_PREFIX="/home/luban/rank-ssl"
+else
+    echo "❌ 未识别运行环境"
+    exit 1
+fi
+
+VAE_ENV_PATH="${DATA_PREFIX}/chenpinyuan/miniconda_base/envs/RQ_VAE"
+export PATH="${VAE_ENV_PATH}/bin:$PATH"
+export PYTHONNOUSERSITE=1
+
+echo ">>> DATA_PREFIX=${DATA_PREFIX}"
+echo ">>> Python=$(which python)"
+python --version
+
+cd "${SCRIPT_DIR}"
+
+python rq/generate_indices.py \
+    --ckpt_path "$CKPT_PATH" \
+    --output_file "$OUTPUT_FILE"
