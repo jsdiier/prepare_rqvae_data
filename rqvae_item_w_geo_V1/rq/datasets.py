@@ -71,6 +71,7 @@ class EmbDataset(data.Dataset):
             self._cache_descr, self._cache_dtype = "<f4", np.float32
             suffix = ".embcache.npy"
 
+
         # EMB_CACHE_DIR 可把缓存重定向到本地盘（NFS 上 mmap 随机读极慢时用）
         cache_dir = os.environ.get("EMB_CACHE_DIR")
         if cache_dir:
