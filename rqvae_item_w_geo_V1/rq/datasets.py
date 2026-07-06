@@ -1,0 +1,238 @@
+import os
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+import torch
+import torch.utils.data as data
+
+EMB_COLUMN_KEYWORDS = ["emb", "embedding", "vector", "feat"]
+
+
+class EmbDataset(data.Dataset):
+
+    def __init__(self, data_path, emb_column=None):
+        """
+        data_path: 支持 .npy / .npz / .parquet / .csv
+        emb_column: 当输入是 parquet/csv 且存在多列时，显式指定 embedding 所在的列名
+
+        parquet 采用流式读取：逐 row-group 转换并写入磁盘 memmap 缓存
+        （<data_path>.embcache.npy），训练时按需分页加载，峰值内存与数据总量无关；
+        缓存存在且比 parquet 新时直接复用。
+        """
+        self.data_path = data_path
+        self.embeddings = self._load(data_path, emb_column)
+
+        print(f"Loaded embeddings shape: {self.embeddings.shape}")
+        self.dim = self.embeddings.shape[-1]
+
+    def _load(self, data_path, emb_column):
+        ext = os.path.splitext(data_path)[-1].lower()
+
+        if ext == ".npy":
+            arr = np.load(data_path, allow_pickle=True)
+            return self._sanitize(self._to_float_array(arr))
+
+        elif ext == ".npz":
+            npz = np.load(data_path, allow_pickle=True)
+            # 默认取第一个 key，如果只有一个数组
+            keys = list(npz.keys())
+            if len(keys) == 1:
+                arr = npz[keys[0]]
+            elif emb_column is not None and emb_column in keys:
+                arr = npz[emb_column]
+            else:
+                raise ValueError(
+                    f".npz 文件包含多个数组: {keys}，请通过 emb_column 参数指定使用哪一个"
+                )
+            return self._sanitize(self._to_float_array(arr))
+
+        elif ext == ".parquet":
+            return self._load_parquet_streaming(data_path, emb_column)
+
+        elif ext == ".csv":
+            df = pd.read_csv(data_path)
+            return self._sanitize(self._df_to_array(df, emb_column))
+
+        else:
+            raise ValueError(f"不支持的文件格式: {ext}，目前支持 .npy/.npz/.parquet/.csv")
+
+    # ------------------------------------------------------------------
+    # parquet 流式加载 + memmap 缓存
+    # ------------------------------------------------------------------
+    def _load_parquet_streaming(self, data_path, emb_column):
+        cache_path = data_path + ".embcache.npy"
+        pf = pq.ParquetFile(data_path)
+        num_rows = pf.metadata.num_rows
+
+        # 缓存有效：比 parquet 新且行数一致，直接 mmap 复用
+        if os.path.exists(cache_path) and \
+                os.path.getmtime(cache_path) >= os.path.getmtime(data_path):
+            cached = np.load(cache_path, mmap_mode="r")
+            if len(cached) == num_rows:
+                print(f"复用 memmap 缓存: {cache_path} (shape={cached.shape})")
+                return cached
+            print(f"缓存行数({len(cached)})与 parquet({num_rows})不一致，重建缓存")
+            del cached
+
+        emb_column = self._resolve_emb_column(pf.schema_arrow.names, emb_column)
+        print(f"流式读取 parquet: {data_path} (rows={num_rows}, column='{emb_column}')")
+
+        mm = None
+        dim = None
+        offset = 0
+        nan_cnt = 0
+        inf_cnt = 0
+        # 逐 batch 读取：任意时刻内存中只有一个 batch
+        for batch in pf.iter_batches(batch_size=65536, columns=[emb_column]):
+            chunk = self._arrow_list_to_matrix(batch.column(0))
+
+            if mm is None:
+                dim = chunk.shape[1]
+                # open_memmap 生成标准 .npy，后续可直接 np.load(mmap_mode='r')
+                mm = np.lib.format.open_memmap(
+                    cache_path, mode="w+", dtype=np.float32,
+                    shape=(num_rows, dim),
+                )
+            elif chunk.shape[1] != dim:
+                raise ValueError(
+                    f"embedding 维度不一致: 之前为 {dim}，当前 batch 为 {chunk.shape[1]}"
+                )
+
+            nan_mask = np.isnan(chunk)
+            if nan_mask.any():
+                nan_cnt += int(nan_mask.sum())
+                chunk[nan_mask] = 0.0
+            inf_mask = np.isinf(chunk)
+            if inf_mask.any():
+                inf_cnt += int(inf_mask.sum())
+                chunk[inf_mask] = 0.0
+
+            mm[offset:offset + len(chunk)] = chunk
+            offset += len(chunk)
+
+        if mm is None:
+            raise ValueError(f"parquet 文件为空: {data_path}")
+        if offset != num_rows:
+            raise ValueError(f"实际读取行数({offset})与元数据行数({num_rows})不一致")
+
+        if nan_cnt:
+            print(f"Warning: Found {nan_cnt} NaN values in embeddings (已置 0)")
+        if inf_cnt:
+            print(f"Warning: Found {inf_cnt} infinite values in embeddings (已置 0)")
+
+        mm.flush()
+        del mm
+        print(f"memmap 缓存已写入: {cache_path}")
+        # 以只读 mmap 重新打开，DataLoader 多 worker 下安全共享
+        return np.load(cache_path, mmap_mode="r")
+
+    def _resolve_emb_column(self, column_names, emb_column):
+        if emb_column is not None:
+            if emb_column not in column_names:
+                raise ValueError(
+                    f"指定的列 '{emb_column}' 不在文件中，现有列: {list(column_names)}"
+                )
+            return emb_column
+
+        if len(column_names) == 1:
+            return column_names[0]
+
+        candidates = [c for c in column_names
+                      if any(k in c.lower() for k in EMB_COLUMN_KEYWORDS)]
+        if len(candidates) == 1:
+            print(f"自动识别 embedding 列: '{candidates[0]}'")
+            return candidates[0]
+
+        raise ValueError(
+            f"无法自动确定 embedding 列，现有列: {list(column_names)}，"
+            f"请通过 emb_column 参数显式指定"
+        )
+
+    @staticmethod
+    def _arrow_list_to_matrix(col):
+        """arrow list<float> / fixed_size_list<float> 列 → (n, dim) float32 矩阵"""
+        if col.null_count:
+            raise ValueError(f"embedding 列存在 {col.null_count} 个 null 值，请先清洗数据")
+
+        flat = col.flatten()
+        values = flat.to_numpy(zero_copy_only=False)
+        n = len(col)
+        if n == 0 or len(values) % n != 0:
+            raise ValueError(
+                f"embedding 列长度不齐: {n} 行共 {len(values)} 个元素，无法 reshape 成矩阵"
+            )
+        matrix = np.ascontiguousarray(
+            values.reshape(n, len(values) // n), dtype=np.float32
+        )
+        if not matrix.flags.writeable:
+            # arrow 零拷贝出来的 buffer 只读，NaN/inf 清洗需要可写副本
+            matrix = matrix.copy()
+        return matrix
+
+    # ------------------------------------------------------------------
+    # csv / 小数据路径（保持原逻辑）
+    # ------------------------------------------------------------------
+    def _df_to_array(self, df, emb_column):
+        # 1. 显式指定列名
+        if emb_column is not None:
+            if emb_column not in df.columns:
+                raise ValueError(f"指定的列 '{emb_column}' 不在文件中，现有列: {list(df.columns)}")
+            col = df[emb_column]
+            return self._series_to_array(col)
+
+        # 2. 只有一列，直接用
+        if df.shape[1] == 1:
+            return self._series_to_array(df.iloc[:, 0])
+
+        # 3. 尝试按常见命名自动探测
+        candidates = [c for c in df.columns
+                      if any(k in c.lower() for k in EMB_COLUMN_KEYWORDS)]
+        if len(candidates) == 1:
+            print(f"自动识别 embedding 列: '{candidates[0]}'")
+            return self._series_to_array(df[candidates[0]])
+
+        # 4. 都不满足，看看是不是所有列都是数值列（即每行是一个展开的向量，每维一列）
+        if all(pd.api.types.is_numeric_dtype(df[c]) for c in df.columns):
+            print(f"检测到 {df.shape[1]} 个数值列，按展开的向量维度处理")
+            return df.to_numpy(dtype=np.float32)
+
+        raise ValueError(
+            f"无法自动确定 embedding 列，现有列: {list(df.columns)}，"
+            f"请通过 emb_column 参数显式指定"
+        )
+
+    def _series_to_array(self, series):
+        arr = np.stack(series.to_numpy())
+        return self._to_float_array(arr)
+
+    def _to_float_array(self, arr):
+        # 处理 0-d object array（例如 pickle 存的 dict/list）的情况
+        if arr.dtype == object and arr.shape == ():
+            arr = arr.item()
+            if isinstance(arr, dict):
+                raise ValueError(
+                    f"加载到的是 dict 而非数组，keys: {list(arr.keys())}，"
+                    f"请确认数据格式或手动提取所需字段"
+                )
+            arr = np.array(arr)
+        return np.asarray(arr, dtype=np.float32)
+
+    @staticmethod
+    def _sanitize(arr):
+        nan_mask = np.isnan(arr)
+        if nan_mask.any():
+            print(f"Warning: Found {nan_mask.sum()} NaN values in embeddings")
+            arr[nan_mask] = 0.0
+        inf_mask = np.isinf(arr)
+        if inf_mask.any():
+            print(f"Warning: Found {inf_mask.sum()} infinite values in embeddings")
+            arr[inf_mask] = 0.0
+        return arr
+
+    def __getitem__(self, index):
+        # memmap 场景下先拷贝出本条数据，避免 torch 直接引用只读缓冲区
+        emb = np.array(self.embeddings[index], dtype=np.float32)
+        return torch.from_numpy(emb)
+
+    def __len__(self):
+        return len(self.embeddings)
