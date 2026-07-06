@@ -32,6 +32,9 @@ def parse_args():
     parser.add_argument("--loss_type", type=str, default="mse", help="loss_type")
     parser.add_argument("--kmeans_init", type=bool, default=True, help="use kmeans_init or not")
     parser.add_argument("--kmeans_iters", type=int, default=100, help="max kmeans iters")
+    parser.add_argument("--kmeans_init_samples", type=int, default=100_000,
+                        help="训练前用于逐层 kmeans 初始化码本的样本数；"
+                             "0 表示沿用旧行为(用第一个 batch 初始化，样本少易产生死码)")
     parser.add_argument('--sk_epsilons', type=float, nargs='+', default=[0.0, 0.0, 0.0], help="sinkhorn epsilons")
     parser.add_argument("--sk_iters", type=int, default=50, help="max sinkhorn iters")
 
@@ -47,6 +50,37 @@ def parse_args():
     parser.add_argument("--ckpt_dir", type=str, default="", help="output directory for model")
 
     return parser.parse_args()
+
+
+def init_rq_codebooks(model, dataset, sample_n, device):
+    """
+    训练前用大样本逐层初始化 RQ 码本：抽 sample_n 条 → encoder →
+    逐层 kmeans 初始化 + 量化取残差喂给下一层。
+    语义与 vq.py 里"第一个 batch 顺手初始化"相同，但样本量大得多——
+    batch 级样本(如 1024 条聚 256 类)统计上不足，会从第 0 步就产生大量死码。
+    初始化完成后 initted=True，训练时旧的 batch 初始化逻辑自动跳过。
+    """
+    n = len(dataset)
+    sample_n = min(sample_n, n)
+    rng = np.random.default_rng(2024)
+    idx = np.sort(rng.choice(n, size=sample_n, replace=False))
+    emb = np.asarray(dataset.embeddings[idx], dtype=np.float32)
+
+    model.eval()
+    with torch.no_grad():
+        latents = []
+        for s in range(0, len(emb), 8192):
+            batch = torch.from_numpy(emb[s:s + 8192]).to(device)
+            latents.append(model.encoder(batch))
+        residual = torch.cat(latents)
+        for i, quantizer in enumerate(model.rq.vq_layers):
+            t0 = time()
+            quantizer.init_emb(residual)
+            x_res, _, _ = quantizer(residual, use_sk=False)
+            residual = residual - x_res
+            print(f"[kmeans init] level {i}: {sample_n} samples, "
+                  f"耗时 {time() - t0:.1f}s")
+    model.train()
 
 
 if __name__ == '__main__':
@@ -87,6 +121,8 @@ if __name__ == '__main__':
                              batch_size=args.batch_size, shuffle=True,
                              pin_memory=True)
     trainer = Trainer(args,model, len(data_loader))
+    if args.kmeans_init and args.kmeans_init_samples > 0:
+        init_rq_codebooks(model, data, args.kmeans_init_samples, trainer.device)
     best_loss, best_collision_rate = trainer.fit(data_loader)
 
     print("Best Loss",best_loss)
