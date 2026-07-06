@@ -23,6 +23,14 @@ fi
 VAE_ENV_PATH="${DATA_PREFIX}/chenpinyuan/miniconda_base/envs/RQ_VAE"
 export PATH="${VAE_ENV_PATH}/bin:$PATH"
 
+# ------------------------------
+# embedding 缓存策略（rq/datasets.py 读取）
+# fp16: 缓存减半(27G)，可整载进 Pod 内存；IN_MEMORY=1: 强制整载，避开 NFS mmap 随机读
+# ------------------------------
+export EMB_CACHE_DTYPE="${EMB_CACHE_DTYPE:-fp16}"
+export EMB_CACHE_IN_MEMORY="${EMB_CACHE_IN_MEMORY:-1}"
+echo ">>> EMB_CACHE_DTYPE=${EMB_CACHE_DTYPE}, EMB_CACHE_IN_MEMORY=${EMB_CACHE_IN_MEMORY}"
+
 echo "当前使用的 Python 路径: $(which python)"
 echo "开始训练..."
 

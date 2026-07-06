@@ -28,6 +28,11 @@ VAE_ENV_PATH="${DATA_PREFIX}/chenpinyuan/miniconda_base/envs/RQ_VAE"
 export PATH="${VAE_ENV_PATH}/bin:$PATH"
 export PYTHONNOUSERSITE=1
 
+# embedding 缓存策略需与 step3 保持一致（rq/datasets.py 读取）
+export EMB_CACHE_DTYPE="${EMB_CACHE_DTYPE:-fp16}"
+export EMB_CACHE_IN_MEMORY="${EMB_CACHE_IN_MEMORY:-1}"
+echo ">>> EMB_CACHE_DTYPE=${EMB_CACHE_DTYPE}, EMB_CACHE_IN_MEMORY=${EMB_CACHE_IN_MEMORY}"
+
 echo ">>> DATA_PREFIX=${DATA_PREFIX}"
 echo ">>> Python=$(which python)"
 python --version
