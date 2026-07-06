@@ -65,13 +65,14 @@ class EmbDataset(data.Dataset):
         pf = pq.ParquetFile(data_path)
         num_rows = pf.metadata.num_rows
 
-        # 缓存有效：比 parquet 新且行数一致，直接 mmap 复用
+        # 缓存有效：比 parquet 新且行数一致，直接复用
         if os.path.exists(cache_path) and \
                 os.path.getmtime(cache_path) >= os.path.getmtime(data_path):
             cached = np.load(cache_path, mmap_mode="r")
             if len(cached) == num_rows:
-                print(f"复用 memmap 缓存: {cache_path} (shape={cached.shape})")
-                return cached
+                print(f"复用缓存: {cache_path} (shape={cached.shape})")
+                del cached
+                return self._open_cache(cache_path)
             print(f"缓存行数({len(cached)})与 parquet({num_rows})不一致，重建缓存")
             del cached
 
@@ -137,8 +138,43 @@ class EmbDataset(data.Dataset):
 
         os.replace(tmp_path, cache_path)
         print(f"npy 缓存已写入: {cache_path}")
-        # 以只读 mmap 重新打开，DataLoader 多 worker 下安全共享
+        return self._open_cache(cache_path)
+
+    def _open_cache(self, cache_path):
+        """
+        打开缓存：内存装得下就整体读进 RAM（顺序读，NFS 友好，训练全速）；
+        装不下退化为只读 mmap 按需分页（本地 SSD 上没问题，NFS 上随机读会慢）。
+        可用环境变量 EMB_CACHE_IN_MEMORY=1/0 强制开启/关闭整载。
+        """
+        size = os.path.getsize(cache_path)
+        mode = os.environ.get("EMB_CACHE_IN_MEMORY", "auto").lower()
+        if mode in ("1", "true", "yes"):
+            in_memory = True
+        elif mode in ("0", "false", "no"):
+            in_memory = False
+        else:
+            avail = self._available_memory_bytes()
+            in_memory = avail is not None and avail > size * 1.2
+
+        if in_memory:
+            print(f"整体加载缓存到内存: {size / 2**30:.1f} GB，顺序读取中…")
+            arr = np.load(cache_path)
+            print("加载完成")
+            return arr
+
+        print("以只读 mmap 打开缓存（按需分页；如内存充足可设 EMB_CACHE_IN_MEMORY=1 整载提速）")
         return np.load(cache_path, mmap_mode="r")
+
+    @staticmethod
+    def _available_memory_bytes():
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+        except OSError:
+            pass
+        return None
 
     def _resolve_emb_column(self, column_names, emb_column):
         if emb_column is not None:
