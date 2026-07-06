@@ -181,6 +181,8 @@ class Trainer(object):
         train_loss_output += set_color("train loss", "blue") + ": %.4f" % loss
         train_loss_output +=", "
         train_loss_output += set_color("reconstruction loss", "blue") + ": %.4f" % recon_loss
+        train_loss_output += ", "
+        train_loss_output += set_color("lr", "blue") + ": %.2e" % self.optimizer.param_groups[0]["lr"]
         return train_loss_output + "]"
 
 
