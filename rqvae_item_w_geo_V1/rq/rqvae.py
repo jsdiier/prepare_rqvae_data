@@ -7,7 +7,7 @@ import logging
 
 from torch.utils.data import DataLoader
 
-from datasets import EmbDataset
+from datasets import EmbDataset, StreamingEmbDataset
 from models.rqvae import RQVAE
 from trainer import  Trainer
 
@@ -48,6 +48,12 @@ def parse_args():
 
     parser.add_argument('--save_limit', type=int, default=5)
     parser.add_argument("--ckpt_dir", type=str, default="", help="output directory for model")
+
+    parser.add_argument("--streaming", action="store_true",
+                        help="低内存流式训练：顺序分块读 + shuffle buffer，内存 O(buffer)；"
+                             "不加此参数则整载内存训练")
+    parser.add_argument("--stream_buffer_rows", type=int, default=500_000,
+                        help="streaming 模式 shuffle buffer 行数（每个 worker 一份）")
 
     return parser.parse_args()
 
@@ -101,7 +107,11 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG)
 
     """build dataset"""
-    data = EmbDataset(args.data_path)
+    if args.streaming:
+        data = StreamingEmbDataset(args.data_path,
+                                   buffer_rows=args.stream_buffer_rows)
+    else:
+        data = EmbDataset(args.data_path)
     model = RQVAE(in_dim=data.dim,
                   num_emb_list=args.num_emb_list,
                   e_dim=args.e_dim,
@@ -117,8 +127,10 @@ if __name__ == '__main__':
                   sk_iters=args.sk_iters,
                   )
     print(model)
+    # IterableDataset 自带乱序，DataLoader 侧必须 shuffle=False
     data_loader = DataLoader(data,num_workers=args.num_workers,
-                             batch_size=args.batch_size, shuffle=True,
+                             batch_size=args.batch_size,
+                             shuffle=not args.streaming,
                              pin_memory=True)
     trainer = Trainer(args,model, len(data_loader))
     if args.kmeans_init and args.kmeans_init_samples > 0:

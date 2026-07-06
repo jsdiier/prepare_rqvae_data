@@ -11,16 +11,19 @@ EMB_COLUMN_KEYWORDS = ["emb", "embedding", "vector", "feat"]
 
 class EmbDataset(data.Dataset):
 
-    def __init__(self, data_path, emb_column=None):
+    def __init__(self, data_path, emb_column=None, force_mmap=False):
         """
         data_path: 支持 .npy / .npz / .parquet / .csv
         emb_column: 当输入是 parquet/csv 且存在多列时，显式指定 embedding 所在的列名
+        force_mmap: 强制以只读 mmap 打开缓存（无视 EMB_CACHE_IN_MEMORY），
+                    供 StreamingEmbDataset 等顺序读取场景使用
 
         parquet 采用流式读取：逐 row-group 转换并写入磁盘 memmap 缓存
         （<data_path>.embcache.npy），训练时按需分页加载，峰值内存与数据总量无关；
         缓存存在且比 parquet 新时直接复用。
         """
         self.data_path = data_path
+        self._force_mmap = force_mmap
         self.embeddings = self._load(data_path, emb_column)
 
         print(f"Loaded embeddings shape: {self.embeddings.shape}")
@@ -165,6 +168,10 @@ class EmbDataset(data.Dataset):
         装不下退化为只读 mmap 按需分页（本地 SSD 上没问题，NFS 上随机读会慢）。
         可用环境变量 EMB_CACHE_IN_MEMORY=1/0 强制开启/关闭整载。
         """
+        if self._force_mmap:
+            print("以只读 mmap 打开缓存（force_mmap，顺序读取场景）")
+            return np.load(cache_path, mmap_mode="r")
+
         size = os.path.getsize(cache_path)
         mode = os.environ.get("EMB_CACHE_IN_MEMORY", "auto").lower()
         if mode in ("1", "true", "yes"):
@@ -348,3 +355,89 @@ class EmbDataset(data.Dataset):
 
     def __len__(self):
         return len(self.embeddings)
+
+
+class StreamingEmbDataset(data.IterableDataset):
+    """
+    低内存流式数据集：顺序分块读 mmap 缓存 + shuffle buffer 近似随机。
+
+    - I/O 是纯顺序的（NFS 友好），不做随机页读取；
+    - 每读入一个块，随机置换出 buffer 中的等量"原住"样本吐给训练，
+      batch 组成在 buffer_rows 的滑动窗口内接近随机（tf.data 同款语义）；
+    - 每个 epoch 重新打乱块顺序，种子随 epoch/worker 变化；
+    - 常驻内存 ≈ buffer_rows × dim × dtype 字节（每个 DataLoader worker 一份），
+      默认 50w 行 × 1536 维 fp16 ≈ 1.5GB。
+    """
+
+    def __init__(self, data_path, emb_column=None,
+                 block_rows=65536, buffer_rows=500_000, seed=2024):
+        base = EmbDataset(data_path, emb_column, force_mmap=True)
+        self.embeddings = base.embeddings
+        self.dim = base.dim
+        self.block_rows = block_rows
+        self.buffer_rows = buffer_rows
+        self.seed = seed
+        self._epoch = 0
+
+    def __len__(self):
+        return len(self.embeddings)
+
+    def _iter_blocks(self, rng):
+        n = len(self.embeddings)
+        blocks = np.arange((n + self.block_rows - 1) // self.block_rows)
+        rng.shuffle(blocks)
+        info = data.get_worker_info()
+        if info is not None and info.num_workers > 1:
+            blocks = blocks[info.id::info.num_workers]
+        for b in blocks:
+            start = int(b) * self.block_rows
+            # np.asarray 触发一次顺序读，把整块拷出 mmap
+            yield np.asarray(self.embeddings[start:start + self.block_rows])
+
+    @staticmethod
+    def _emit(rows):
+        for row in rows:
+            yield torch.from_numpy(row.astype(np.float32, copy=False))
+
+    def __iter__(self):
+        # 块顺序的种子必须在所有 worker 间一致（先按同一顺序打乱、再按 worker
+        # 分片，否则各 worker 的分片会重叠/遗漏）；DataLoader 每个 epoch 重新分配
+        # base_seed，用 info.seed - info.id 还原。单进程时靠 _epoch 计数器区分 epoch。
+        info = data.get_worker_info()
+        if info is not None:
+            base_seed = info.seed - info.id
+            worker_salt = (info.id + 1) * 7919
+        else:
+            base_seed = torch.initial_seed() + self._epoch * 1000003
+            self._epoch += 1
+            worker_salt = 0
+        block_rng = np.random.default_rng((base_seed + self.seed) % (2 ** 31))
+        # buffer 置换用各 worker 独立的种子
+        rng = np.random.default_rng((base_seed + self.seed + worker_salt) % (2 ** 31))
+
+        buffer = None
+        filled = 0
+        for chunk in self._iter_blocks(block_rng):
+            if buffer is None:
+                buffer = np.empty((self.buffer_rows, chunk.shape[1]),
+                                  dtype=chunk.dtype)
+            # 先把 buffer 灌满
+            if filled < self.buffer_rows:
+                take = min(self.buffer_rows - filled, len(chunk))
+                buffer[filled:filled + take] = chunk[:take]
+                filled += take
+                chunk = chunk[take:]
+            # 稳态：随机选槽位，弹出原住样本，换入新样本
+            while len(chunk):
+                m = min(len(chunk), filled)
+                slots = rng.choice(filled, size=m, replace=False)
+                out = buffer[slots].copy()
+                buffer[slots] = chunk[:m]
+                chunk = chunk[m:]
+                yield from self._emit(out)
+
+        # 收尾：清空 buffer
+        if buffer is not None and filled:
+            rest = buffer[:filled]
+            rng.shuffle(rest)
+            yield from self._emit(rest)

@@ -31,6 +31,21 @@ export EMB_CACHE_DTYPE="${EMB_CACHE_DTYPE:-fp16}"
 export EMB_CACHE_IN_MEMORY="${EMB_CACHE_IN_MEMORY:-1}"
 echo ">>> EMB_CACHE_DTYPE=${EMB_CACHE_DTYPE}, EMB_CACHE_IN_MEMORY=${EMB_CACHE_IN_MEMORY}"
 
+# ------------------------------
+# FULL_MEMORY=1（默认）: 27G 全量整载内存训练，速度最快，需要 Pod 有足够空闲内存；
+# FULL_MEMORY=0        : 顺序分块读 + shuffle buffer 流式训练，内存 ~2G，
+#                        邻居任务挤占内存、整载被 OOM kill 时用这个。
+# 用法: FULL_MEMORY=0 bash step3_train_rq_vae.sh
+# ------------------------------
+FULL_MEMORY="${FULL_MEMORY:-1}"
+EXTRA_ARGS=""
+if [ "${FULL_MEMORY}" = "0" ]; then
+    EXTRA_ARGS="--streaming"
+    echo ">>> FULL_MEMORY=0，启用流式分块训练（低内存）"
+else
+    echo ">>> FULL_MEMORY=1，整载内存训练"
+fi
+
 echo "当前使用的 Python 路径: $(which python)"
 echo "开始训练..."
 
@@ -48,4 +63,5 @@ python rq/rqvae.py \
   --warmup_epochs 1 \
   --eval_step 1 \
   --sk_epsilons 0.003 0.0 0.003 \
-  --batch_size 1024
+  --batch_size 1024 \
+  ${EXTRA_ARGS}
