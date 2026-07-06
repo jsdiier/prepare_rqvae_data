@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ------------------------
 # 用户可修改参数
 # ------------------------
-CKPT_PATH="./rq/rq_model/Jul-03-2026_17-41-45/best_collision_model.pth"
+CKPT_PATH="./rq/rq_model/Jul-06-2026_11-25-44/best_collision_model.pth"
 OUTPUT_FILE="./item_info/MX_item_recall.index.parquet"
 
 # ===============================
