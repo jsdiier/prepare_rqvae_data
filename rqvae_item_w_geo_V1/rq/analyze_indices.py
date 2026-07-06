@@ -71,6 +71,23 @@ def collision_report(codes):
     print(f"独占 SID 的 item 数: {only_one} ({only_one / total * 100:.1f}%)")
 
 
+def dup_report(emb_cache):
+    """全量扫描：精确统计完全重复的 embedding 占比（= SID 冲突率的理论下界）"""
+    print("\n========== embedding 全量重复统计 ==========")
+    arr = np.load(emb_cache, mmap_mode="r")
+    seen = set()
+    step = 262144
+    for i in tqdm(range(0, len(arr), step), desc="hashing rows", ncols=100):
+        chunk = np.ascontiguousarray(arr[i:i + step])
+        for row in chunk:
+            seen.add(hash(row.tobytes()))
+    total = len(arr)
+    distinct = len(seen)
+    print(f"总条数: {total}")
+    print(f"唯一 embedding 数: {distinct}")
+    print(f"重复占比(冲突率理论下界): {(total - distinct) / total * 100:.2f}%")
+
+
 def emb_report(emb_cache, sample_n=200_000):
     print("\n========== embedding 范数分布（采样） ==========")
     arr = np.load(emb_cache, mmap_mode="r")
@@ -91,6 +108,8 @@ if __name__ == "__main__":
     parser.add_argument("--index_file", required=True)
     parser.add_argument("--emb_cache", default=None,
                         help="可选，item_emb.parquet.embcache*.npy 路径")
+    parser.add_argument("--dup_check", action="store_true",
+                        help="全量扫描 embedding 重复占比（需 --emb_cache，几分钟）")
     args = parser.parse_args()
 
     codes, code_cols = load_codes(args.index_file)
@@ -98,3 +117,5 @@ if __name__ == "__main__":
     collision_report(codes)
     if args.emb_cache:
         emb_report(args.emb_cache)
+        if args.dup_check:
+            dup_report(args.emb_cache)

@@ -47,5 +47,5 @@ python rq/rqvae.py \
   --epochs 15 \
   --warmup_epochs 1 \
   --eval_step 1 \
-  --sk_epsilons 0.0 0.0 0.003 \
+  --sk_epsilons 0.003 0.0 0.003 \
   --batch_size 1024
