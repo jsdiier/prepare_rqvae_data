@@ -51,9 +51,6 @@ echo "开始训练..."
 
 # ------------------------------
 # 4️⃣ 启动训练
-# 注意: trainer 的 warmup_steps = warmup_epochs * 每epoch步数，
-# warmup_epochs 默认 50 是给"小数据跑几千个 epoch"设计的；
-# 大数据少 epoch 场景必须显式调小，否则 lr 全程处于 warmup 爬坡段，等于没训
 # ------------------------------
 python rq/rqvae.py \
   --data_path ./item_info/item_emb.parquet \

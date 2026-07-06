@@ -4,6 +4,7 @@ import torch
 import numpy as np
 from time import time
 import logging
+from tqdm import tqdm
 
 from torch.utils.data import DataLoader
 
@@ -58,24 +59,42 @@ def parse_args():
     return parser.parse_args()
 
 
-def init_rq_codebooks(model, dataset, sample_n, device):
+def init_rq_codebooks(model, dataset, sample_n, device, block_rows=100):
     """
     训练前用大样本逐层初始化 RQ 码本：抽 sample_n 条 → encoder →
     逐层 kmeans 初始化 + 量化取残差喂给下一层。
     语义与 vq.py 里"第一个 batch 顺手初始化"相同，但样本量大得多——
     batch 级样本(如 1024 条聚 256 类)统计上不足，会从第 0 步就产生大量死码。
     初始化完成后 initted=True，训练时旧的 batch 初始化逻辑自动跳过。
+
+    采样方式为"随机块采样"：随机选 sample_n/block_rows 个位置，每个位置
+    连续读 block_rows 行。相比全局散点随机抽行，顺序小段读对 mmap/NFS
+    友好得多（散点随机读在 NFS 上会阻塞数分钟且不可中断，表现为假死）。
     """
     n = len(dataset)
     sample_n = min(sample_n, n)
     rng = np.random.default_rng(2024)
-    idx = np.sort(rng.choice(n, size=sample_n, replace=False))
-    emb = np.asarray(dataset.embeddings[idx], dtype=np.float32)
+
+    total_blocks = max(n // block_rows, 1)
+    num_blocks = min((sample_n + block_rows - 1) // block_rows, total_blocks)
+    chosen = rng.choice(total_blocks, size=num_blocks, replace=False)
+    chosen.sort()  # 按文件顺序访问，进一步利用预读
+
+    parts = []
+    for b in tqdm(chosen, desc="[kmeans init] 采样", ncols=100):
+        start = int(b) * block_rows
+        block = np.asarray(dataset.embeddings[start:start + block_rows],
+                           dtype=np.float32)
+        parts.append(block)
+    emb = np.concatenate(parts)[:sample_n]
+    print(f"[kmeans init] 采样完成: {len(emb)} 条 "
+          f"({num_blocks} 个随机块 x {block_rows} 行)")
 
     model.eval()
     with torch.no_grad():
         latents = []
-        for s in range(0, len(emb), 8192):
+        for s in tqdm(range(0, len(emb), 8192),
+                      desc="[kmeans init] 编码", ncols=100):
             batch = torch.from_numpy(emb[s:s + 8192]).to(device)
             latents.append(model.encoder(batch))
         residual = torch.cat(latents)
@@ -84,7 +103,7 @@ def init_rq_codebooks(model, dataset, sample_n, device):
             quantizer.init_emb(residual)
             x_res, _, _ = quantizer(residual, use_sk=False)
             residual = residual - x_res
-            print(f"[kmeans init] level {i}: {sample_n} samples, "
+            print(f"[kmeans init] level {i}: kmeans({len(residual)} 条) "
                   f"耗时 {time() - t0:.1f}s")
     model.train()
 
