@@ -4,6 +4,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 import torch
 import torch.utils.data as data
+from tqdm import tqdm
 
 EMB_COLUMN_KEYWORDS = ["emb", "embedding", "vector", "feat"]
 
@@ -83,14 +84,16 @@ class EmbDataset(data.Dataset):
         nan_cnt = 0
         inf_cnt = 0
         # 逐 batch 读取：任意时刻内存中只有一个 batch
+        pbar = tqdm(total=num_rows, desc="parquet -> memmap", unit="row", ncols=100)
         for batch in pf.iter_batches(batch_size=65536, columns=[emb_column]):
             chunk = self._arrow_list_to_matrix(batch.column(0))
 
             if mm is None:
                 dim = chunk.shape[1]
-                # open_memmap 生成标准 .npy，后续可直接 np.load(mmap_mode='r')
+                # 先写临时文件，全部完成后原子重命名；避免中途被 kill 留下
+                # 一个大小/行数看似完整、实际后半段全 0 的假缓存被误复用
                 mm = np.lib.format.open_memmap(
-                    cache_path, mode="w+", dtype=np.float32,
+                    cache_path + ".tmp", mode="w+", dtype=np.float32,
                     shape=(num_rows, dim),
                 )
             elif chunk.shape[1] != dim:
@@ -109,6 +112,8 @@ class EmbDataset(data.Dataset):
 
             mm[offset:offset + len(chunk)] = chunk
             offset += len(chunk)
+            pbar.update(len(chunk))
+        pbar.close()
 
         if mm is None:
             raise ValueError(f"parquet 文件为空: {data_path}")
@@ -122,6 +127,7 @@ class EmbDataset(data.Dataset):
 
         mm.flush()
         del mm
+        os.replace(cache_path + ".tmp", cache_path)
         print(f"memmap 缓存已写入: {cache_path}")
         # 以只读 mmap 重新打开，DataLoader 多 worker 下安全共享
         return np.load(cache_path, mmap_mode="r")
