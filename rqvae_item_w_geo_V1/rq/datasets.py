@@ -78,44 +78,54 @@ class EmbDataset(data.Dataset):
         emb_column = self._resolve_emb_column(pf.schema_arrow.names, emb_column)
         print(f"流式读取 parquet: {data_path} (rows={num_rows}, column='{emb_column}')")
 
-        mm = None
+        tmp_path = cache_path + ".tmp"
+        out = None
         dim = None
         offset = 0
         nan_cnt = 0
         inf_cnt = 0
-        # 逐 batch 读取：任意时刻内存中只有一个 batch
-        pbar = tqdm(total=num_rows, desc="parquet -> memmap", unit="row", ncols=100)
-        for batch in pf.iter_batches(batch_size=65536, columns=[emb_column]):
-            chunk = self._arrow_list_to_matrix(batch.column(0))
+        # 逐 batch 读取：任意时刻内存中只有一个 batch。
+        # 采用顺序 append 写普通 .npy 文件（先写 header 再逐块追加数据），
+        # 不用 memmap 原地填：NFS 上 mmap 脏页回写极慢，顺序 write 快一个量级，
+        # 且文件随写入增长，du 可直接当进度参考。
+        # 全部完成后原子重命名，避免中途被 kill 留下半成品被误复用。
+        pbar = tqdm(total=num_rows, desc="parquet -> npy cache", unit="row", ncols=100)
+        try:
+            for batch in pf.iter_batches(batch_size=65536, columns=[emb_column]):
+                chunk = self._arrow_list_to_matrix(batch.column(0))
 
-            if mm is None:
-                dim = chunk.shape[1]
-                # 先写临时文件，全部完成后原子重命名；避免中途被 kill 留下
-                # 一个大小/行数看似完整、实际后半段全 0 的假缓存被误复用
-                mm = np.lib.format.open_memmap(
-                    cache_path + ".tmp", mode="w+", dtype=np.float32,
-                    shape=(num_rows, dim),
-                )
-            elif chunk.shape[1] != dim:
-                raise ValueError(
-                    f"embedding 维度不一致: 之前为 {dim}，当前 batch 为 {chunk.shape[1]}"
-                )
+                if out is None:
+                    dim = chunk.shape[1]
+                    out = open(tmp_path, "wb")
+                    # write_array_header_1_0 自带 magic 前缀，不要重复写
+                    np.lib.format.write_array_header_1_0(
+                        out,
+                        {"descr": "<f4", "fortran_order": False,
+                         "shape": (num_rows, dim)},
+                    )
+                elif chunk.shape[1] != dim:
+                    raise ValueError(
+                        f"embedding 维度不一致: 之前为 {dim}，当前 batch 为 {chunk.shape[1]}"
+                    )
 
-            nan_mask = np.isnan(chunk)
-            if nan_mask.any():
-                nan_cnt += int(nan_mask.sum())
-                chunk[nan_mask] = 0.0
-            inf_mask = np.isinf(chunk)
-            if inf_mask.any():
-                inf_cnt += int(inf_mask.sum())
-                chunk[inf_mask] = 0.0
+                nan_mask = np.isnan(chunk)
+                if nan_mask.any():
+                    nan_cnt += int(nan_mask.sum())
+                    chunk[nan_mask] = 0.0
+                inf_mask = np.isinf(chunk)
+                if inf_mask.any():
+                    inf_cnt += int(inf_mask.sum())
+                    chunk[inf_mask] = 0.0
 
-            mm[offset:offset + len(chunk)] = chunk
-            offset += len(chunk)
-            pbar.update(len(chunk))
-        pbar.close()
+                out.write(np.ascontiguousarray(chunk, dtype="<f4").tobytes())
+                offset += len(chunk)
+                pbar.update(len(chunk))
+        finally:
+            pbar.close()
+            if out is not None:
+                out.close()
 
-        if mm is None:
+        if out is None:
             raise ValueError(f"parquet 文件为空: {data_path}")
         if offset != num_rows:
             raise ValueError(f"实际读取行数({offset})与元数据行数({num_rows})不一致")
@@ -125,10 +135,8 @@ class EmbDataset(data.Dataset):
         if inf_cnt:
             print(f"Warning: Found {inf_cnt} infinite values in embeddings (已置 0)")
 
-        mm.flush()
-        del mm
-        os.replace(cache_path + ".tmp", cache_path)
-        print(f"memmap 缓存已写入: {cache_path}")
+        os.replace(tmp_path, cache_path)
+        print(f"npy 缓存已写入: {cache_path}")
         # 以只读 mmap 重新打开，DataLoader 多 worker 下安全共享
         return np.load(cache_path, mmap_mode="r")
 
