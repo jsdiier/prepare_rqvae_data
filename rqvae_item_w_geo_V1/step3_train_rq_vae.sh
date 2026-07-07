@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 export PYTHONNOUSERSITE=1
+# nohup 重定向到文件时禁用 stdout 块缓冲，否则 sklearn 等库的逐行日志
+# 会攒满 4KB 才批量刷出，看起来像卡住
+export PYTHONUNBUFFERED=1
 
 echo "================ 当前执行脚本内容 ================"
 cat "$0"
