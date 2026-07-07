@@ -35,7 +35,7 @@ echo ">>> EMB_CACHE_DTYPE=${EMB_CACHE_DTYPE}, EMB_CACHE_IN_MEMORY=${EMB_CACHE_IN
 # FULL_MEMORY=1（默认）: 27G 全量整载内存训练，速度最快，需要 Pod 有足够空闲内存；
 # FULL_MEMORY=0        : 顺序分块读 + shuffle buffer 流式训练，内存 ~2G，
 #                        邻居任务挤占内存、整载被 OOM kill 时用这个。
-# 用法: FULL_MEMORY=0 bash step3_train_rq_vae.sh
+# 用法: FULL_MEMORY=0 nohup bash step3_train_rq_vae.sh > train_rqvae.log 2>&1 &
 # ------------------------------
 FULL_MEMORY="${FULL_MEMORY:-1}"
 EXTRA_ARGS=""
