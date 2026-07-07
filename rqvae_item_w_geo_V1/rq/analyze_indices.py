@@ -65,8 +65,8 @@ def collision_report(codes):
     top = np.sort(counts)[::-1]
     print(f"最大冲突桶: {top[0]} 条")
     level_prefix = "abcde"
-    print("top10 冲突桶:")
-    for rank, i in enumerate(np.argsort(counts)[::-1][:10], 1):
+    print("top100 冲突桶:")
+    for rank, i in enumerate(np.argsort(counts)[::-1][:100], 1):
         sid = "".join(f"<{level_prefix[lvl]}_{uniq[i, lvl]}>"
                       for lvl in range(codes.shape[1]))
         print(f"  #{rank:<2d} {sid}  {counts[i]} 条")
