@@ -52,6 +52,9 @@ echo "开始训练..."
 # ------------------------------
 # 4️⃣ 启动训练
 # ------------------------------
+# e_dim 128: 量化隐向量维度（原 32 维瓶颈会把"2张披萨 vs 1张大披萨"级别的
+#            细微差异在量化前就压掉）；layers 随之截短——encoder 结构是
+#            [1536]+layers+[e_dim]，若保留 ...128,64 则 64 维仍是真瓶颈
 python rq/rqvae.py \
   --data_path ./item_info/item_emb.parquet \
   --ckpt_dir ./rq/rq_model \
@@ -60,5 +63,7 @@ python rq/rqvae.py \
   --warmup_epochs 1 \
   --eval_step 1 \
   --sk_epsilons 0.003 0.0 0.003 \
+  --e_dim 128 \
+  --layers 2048 1024 512 256 \
   --batch_size 1024 \
   ${EXTRA_ARGS}

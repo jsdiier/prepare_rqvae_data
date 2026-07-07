@@ -39,6 +39,7 @@ python --version
 
 cd "${SCRIPT_DIR}"
 
+# EMB_CACHE_IN_MEMORY=0 bash step4_get_sid.sh
 python rq/generate_indices.py \
     --ckpt_path "$CKPT_PATH" \
     --output_file "$OUTPUT_FILE"
