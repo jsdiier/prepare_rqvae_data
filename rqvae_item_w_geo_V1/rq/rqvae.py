@@ -98,8 +98,11 @@ def init_rq_codebooks(model, dataset, sample_n, device, block_rows=100):
             batch = torch.from_numpy(emb[s:s + 8192]).to(device)
             latents.append(model.encoder(batch))
         residual = torch.cat(latents)
+        num_levels = len(model.rq.vq_layers)
         for i, quantizer in enumerate(model.rq.vq_layers):
             t0 = time()
+            print(f"[kmeans init] level {i}/{num_levels - 1}: 开始 kmeans 聚类"
+                  f"（下方为 sklearn 逐迭代日志，n_init=2 会跑两轮）", flush=True)
             quantizer.init_emb(residual)
             x_res, _, _ = quantizer(residual, use_sk=False)
             residual = residual - x_res

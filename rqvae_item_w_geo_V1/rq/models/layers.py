@@ -74,7 +74,11 @@ def kmeans(
     B, dim, dtype, device = samples.shape[0], samples.shape[-1], samples.dtype, samples.device
     x = samples.cpu().detach().numpy()
 
-    cluster = KMeans(n_clusters = num_clusters, max_iter = num_iters).fit(x)
+    # n_init=2: 大样本(10w级)初始化下多次随机重启收益极小，
+    # 从默认 10 降到 2 可把初始化耗时压缩 ~5 倍
+    # verbose=1: 逐迭代打印 inertia，训练日志里可感知聚类进度
+    cluster = KMeans(n_clusters = num_clusters, max_iter = num_iters,
+                     n_init = 2, verbose = 1).fit(x)
 
     centers = cluster.cluster_centers_
     tensor_centers = torch.from_numpy(centers).to(device)
