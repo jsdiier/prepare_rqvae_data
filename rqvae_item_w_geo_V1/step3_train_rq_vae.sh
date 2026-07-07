@@ -52,10 +52,16 @@ echo "开始训练..."
 # ------------------------------
 # 4️⃣ 启动训练
 # ------------------------------
+# 把 PID 写入文件，方便直接终止训练：kill $(cat train_rqvae.pid)
+# exec 会让 python 替换当前 bash 进程，因此该 PID 就是训练进程本身，
+# 杀掉它即可（DataLoader worker 检测到主进程退出会自动跟随退出）
+echo $$ > train_rqvae.pid
+echo ">>> 训练 PID: $$ (已写入 train_rqvae.pid，终止: kill \$(cat train_rqvae.pid))"
+
 # e_dim 128: 量化隐向量维度（原 32 维瓶颈会把"2张披萨 vs 1张大披萨"级别的
 #            细微差异在量化前就压掉）；layers 随之截短——encoder 结构是
 #            [1536]+layers+[e_dim]，若保留 ...128,64 则 64 维仍是真瓶颈
-python rq/rqvae.py \
+exec python rq/rqvae.py \
   --data_path ./item_info/item_emb.parquet \
   --ckpt_dir ./rq/rq_model \
   --lr 1e-3 \
