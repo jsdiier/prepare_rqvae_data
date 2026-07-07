@@ -9,6 +9,9 @@
 用法:
     python rq/analyze_indices.py --index_file ./item_info/MX_item_recall.index.parquet
     python rq/analyze_indices.py --index_file ... --emb_cache ./item_info/item_emb.parquet.embcache.f16.npy
+    python rq/analyze_indices.py \
+        --index_file ./item_info/MX_item_recall.index.parquet \
+        --item_file  ./item_info/MX_item_recall.item.parquet
 """
 import argparse
 import re
