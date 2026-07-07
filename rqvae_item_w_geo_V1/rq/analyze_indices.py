@@ -56,7 +56,7 @@ def level_report(codes, code_cols):
 
 def collision_report(codes):
     print("\n========== SID 冲突统计 ==========")
-    _, counts = np.unique(codes, axis=0, return_counts=True)
+    uniq, counts = np.unique(codes, axis=0, return_counts=True)
     total = len(codes)
     unique = len(counts)
     print(f"总条数: {total}")
@@ -64,7 +64,12 @@ def collision_report(codes):
     print(f"冲突率: {(total - unique) / total * 100:.2f}%")
     top = np.sort(counts)[::-1]
     print(f"最大冲突桶: {top[0]} 条")
-    print(f"top10 冲突桶: {top[:10].tolist()}")
+    level_prefix = "abcde"
+    print("top10 冲突桶:")
+    for rank, i in enumerate(np.argsort(counts)[::-1][:10], 1):
+        sid = "".join(f"<{level_prefix[lvl]}_{uniq[i, lvl]}>"
+                      for lvl in range(codes.shape[1]))
+        print(f"  #{rank:<2d} {sid}  {counts[i]} 条")
     for q in (50, 90, 99):
         print(f"桶大小 P{q}: {int(np.percentile(counts, q))}")
     only_one = int((counts == 1).sum())
