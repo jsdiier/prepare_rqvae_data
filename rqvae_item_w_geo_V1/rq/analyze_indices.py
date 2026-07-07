@@ -76,6 +76,47 @@ def collision_report(codes):
     print(f"独占 SID 的 item 数: {only_one} ({only_one / total * 100:.1f}%)")
 
 
+def geo_collision_report(codes, item_file):
+    """按 (geohash + SID) 的完整标识符口径统计冲突（与 index 按行序对齐）"""
+    print("\n========== geo_sid 冲突统计 (geohash + SID) ==========")
+    pf = pq.ParquetFile(item_file)
+    if "geohash" not in pf.schema_arrow.names:
+        print(f"[WARN] {item_file} 中没有 geohash 列，跳过")
+        return
+    n_item = pf.metadata.num_rows
+    if n_item != len(codes):
+        print(f"[WARN] item 行数({n_item})与 index 行数({len(codes)})不一致，跳过")
+        return
+
+    # geohash 字符串 → 整数 id，与 codes 拼成 (n, 1+L) 矩阵做 unique
+    geo_ids = np.empty(len(codes), dtype=np.int32)
+    geo_map = {}
+    offset = 0
+    for batch in tqdm(pf.iter_batches(batch_size=262144, columns=["geohash"]),
+                      desc="reading geohash", ncols=100):
+        for v in batch.column(0).to_pylist():
+            key = v or ""
+            gid = geo_map.get(key)
+            if gid is None:
+                gid = len(geo_map)
+                geo_map[key] = gid
+            geo_ids[offset] = gid
+            offset += 1
+    print(f"唯一 geohash 数: {len(geo_map)}")
+
+    combined = np.column_stack([geo_ids, codes])
+    _, counts = np.unique(combined, axis=0, return_counts=True)
+    total = len(combined)
+    unique = len(counts)
+    print(f"总条数: {total}")
+    print(f"唯一 geo_sid 数: {unique}")
+    print(f"冲突率: {(total - unique) / total * 100:.2f}%")
+    top = np.sort(counts)[::-1]
+    print(f"最大冲突桶: {top[0]} 条")
+    only_one = int((counts == 1).sum())
+    print(f"独占 geo_sid 的 item 数: {only_one} ({only_one / total * 100:.1f}%)")
+
+
 def dup_report(emb_cache):
     """全量扫描：精确统计完全重复的 embedding 占比（= SID 冲突率的理论下界）"""
     print("\n========== embedding 全量重复统计 ==========")
@@ -115,11 +156,16 @@ if __name__ == "__main__":
                         help="可选，item_emb.parquet.embcache*.npy 路径")
     parser.add_argument("--dup_check", action="store_true",
                         help="全量扫描 embedding 重复占比（需 --emb_cache，几分钟）")
+    parser.add_argument("--item_file", default=None,
+                        help="可选，item parquet 路径(含 geohash 列，与 index 行序对齐)；"
+                             "传入后按 geohash+SID 完整口径再算一遍冲突")
     args = parser.parse_args()
 
     codes, code_cols = load_codes(args.index_file)
     level_report(codes, code_cols)
     collision_report(codes)
+    if args.item_file:
+        geo_collision_report(codes, args.item_file)
     if args.emb_cache:
         emb_report(args.emb_cache)
         if args.dup_check:
