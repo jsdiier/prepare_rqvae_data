@@ -1,0 +1,78 @@
+#!/bin/bash
+set -e
+export PYTHONNOUSERSITE=1
+# nohup 重定向到文件时禁用 stdout 块缓冲，否则 sklearn 等库的逐行日志
+# 会攒满 4KB 才批量刷出，看起来像卡住
+export PYTHONUNBUFFERED=1
+
+echo "================ 当前执行脚本内容 ================"
+cat "$0"
+echo "=================================================="
+
+# ------------------------------
+# 2️⃣ 动态识别根目录
+# ------------------------------
+if [ -d "/nfs/dataset-ofs-rank-ssl" ]; then
+    DATA_PREFIX="/nfs/dataset-ofs-rank-ssl"
+    echo ">>> 检测到训练平台环境 (NFS)，使用路径: ${DATA_PREFIX}"
+else
+    DATA_PREFIX="/home/luban/rank-ssl"
+    echo ">>> 检测到本地 SSH 环境，使用路径: ${DATA_PREFIX}"
+fi
+
+# ------------------------------
+# 3️⃣ 激活虚拟环境
+# ------------------------------
+VAE_ENV_PATH="${DATA_PREFIX}/chenpinyuan/miniconda_base/envs/RQ_VAE"
+export PATH="${VAE_ENV_PATH}/bin:$PATH"
+
+# ------------------------------
+# embedding 缓存策略（rq/datasets.py 读取）
+# fp16: 缓存减半(27G)，可整载进 Pod 内存；IN_MEMORY=1: 强制整载，避开 NFS mmap 随机读
+# ------------------------------
+export EMB_CACHE_DTYPE="${EMB_CACHE_DTYPE:-fp16}"
+export EMB_CACHE_IN_MEMORY="${EMB_CACHE_IN_MEMORY:-1}"
+echo ">>> EMB_CACHE_DTYPE=${EMB_CACHE_DTYPE}, EMB_CACHE_IN_MEMORY=${EMB_CACHE_IN_MEMORY}"
+
+# ------------------------------
+# FULL_MEMORY=1（默认）: 27G 全量整载内存训练，速度最快，需要 Pod 有足够空闲内存；
+# FULL_MEMORY=0        : 顺序分块读 + shuffle buffer 流式训练，内存 ~2G，
+#                        邻居任务挤占内存、整载被 OOM kill 时用这个。
+# 用法: FULL_MEMORY=0 nohup bash step3_train_rq_vae.sh > train_rqvae.log 2>&1 &
+# ------------------------------
+FULL_MEMORY="${FULL_MEMORY:-1}"
+EXTRA_ARGS=""
+if [ "${FULL_MEMORY}" = "0" ]; then
+    EXTRA_ARGS="--streaming"
+    echo ">>> FULL_MEMORY=0，启用流式分块训练（低内存）"
+else
+    echo ">>> FULL_MEMORY=1，整载内存训练"
+fi
+
+echo "当前使用的 Python 路径: $(which python)"
+echo "开始训练..."
+
+# ------------------------------
+# 4️⃣ 启动训练
+# ------------------------------
+# 把 PID 写入文件，方便直接终止训练：kill $(cat train_rqvae.pid)
+# exec 会让 python 替换当前 bash 进程，因此该 PID 就是训练进程本身，
+# 杀掉它即可（DataLoader worker 检测到主进程退出会自动跟随退出）
+echo $$ > train_rqvae.pid
+echo ">>> 训练 PID: $$ (已写入 train_rqvae.pid，终止: kill \$(cat train_rqvae.pid))"
+
+# e_dim 128: 量化隐向量维度（原 32 维瓶颈会把"2张披萨 vs 1张大披萨"级别的
+#            细微差异在量化前就压掉）；layers 随之截短——encoder 结构是
+#            [1536]+layers+[e_dim]，若保留 ...128,64 则 64 维仍是真瓶颈
+exec python rq/rqvae.py \
+  --data_path ./item_info/item_emb.parquet \
+  --ckpt_dir ./rq/rq_model \
+  --lr 1e-3 \
+  --epochs 15 \
+  --warmup_epochs 1 \
+  --eval_step 1 \
+  --sk_epsilons 0.003 0.0 0.003 \
+  --e_dim 128 \
+  --layers 2048 1024 512 256 \
+  --batch_size 1024 \
+  ${EXTRA_ARGS}
