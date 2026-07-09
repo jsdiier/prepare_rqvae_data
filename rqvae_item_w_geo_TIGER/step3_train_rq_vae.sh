@@ -10,6 +10,38 @@ cat "$0"
 echo "=================================================="
 
 # ------------------------------
+# 1️⃣ 读取 common.conf 中 [rqvae_train] 段的训练参数
+# ------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF_FILE="${1:-${SCRIPT_DIR}/common.conf}"
+echo ">>> conf_file=${CONF_FILE}"
+
+get_conf() {
+    awk -F '=' -v sec="$1" -v key="$2" '
+        /^\[/ { in_sec = ($0 == "[" sec "]") }
+        in_sec && !/^[ \t]*[#;]/ && /=/ {
+            k = $1; gsub(/^[ \t]+|[ \t]+$/, "", k)
+            if (k == key) {
+                v = substr($0, index($0, "=") + 1)
+                gsub(/^[ \t]+|[ \t]+$/, "", v)
+                print v; exit
+            }
+        }
+    ' "${CONF_FILE}"
+}
+
+DATA_PATH="$(get_conf rqvae_train data_path)"
+CKPT_DIR="$(get_conf rqvae_train ckpt_dir)"
+LR="$(get_conf rqvae_train lr)"
+EPOCHS="$(get_conf rqvae_train epochs)"
+WARMUP_EPOCHS="$(get_conf rqvae_train warmup_epochs)"
+EVAL_STEP="$(get_conf rqvae_train eval_step)"
+SK_EPSILONS="$(get_conf rqvae_train sk_epsilons)"
+E_DIM="$(get_conf rqvae_train e_dim)"
+LAYERS="$(get_conf rqvae_train layers)"
+BATCH_SIZE="$(get_conf rqvae_train batch_size)"
+
+# ------------------------------
 # 2️⃣ 动态识别根目录
 # ------------------------------
 if [ -d "/nfs/dataset-ofs-rank-ssl" ]; then
@@ -61,18 +93,17 @@ echo "开始训练..."
 echo $$ > train_rqvae.pid
 echo ">>> 训练 PID: $$ (已写入 train_rqvae.pid，终止: kill \$(cat train_rqvae.pid))"
 
-# e_dim 128: 量化隐向量维度（原 32 维瓶颈会把"2张披萨 vs 1张大披萨"级别的
-#            细微差异在量化前就压掉）；layers 随之截短——encoder 结构是
-#            [1536]+layers+[e_dim]，若保留 ...128,64 则 64 维仍是真瓶颈
+# 训练参数统一在 common.conf 的 [rqvae_train] 段配置
+# SK_EPSILONS / LAYERS 是空格分隔的多值参数，不能加引号，需依赖 word-splitting
 exec python rq/rqvae.py \
-  --data_path ./item_info/item_emb.parquet \
-  --ckpt_dir ./rq/rq_model \
-  --lr 1e-3 \
-  --epochs 15 \
-  --warmup_epochs 1 \
-  --eval_step 1 \
-  --sk_epsilons 0.003 0.0 0.003 \
-  --e_dim 128 \
-  --layers 2048 1024 512 256 \
-  --batch_size 1024 \
+  --data_path "${DATA_PATH}" \
+  --ckpt_dir "${CKPT_DIR}" \
+  --lr "${LR}" \
+  --epochs "${EPOCHS}" \
+  --warmup_epochs "${WARMUP_EPOCHS}" \
+  --eval_step "${EVAL_STEP}" \
+  --sk_epsilons ${SK_EPSILONS} \
+  --e_dim "${E_DIM}" \
+  --layers ${LAYERS} \
+  --batch_size "${BATCH_SIZE}" \
   ${EXTRA_ARGS}
